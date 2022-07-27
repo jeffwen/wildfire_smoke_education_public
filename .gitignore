@@ -1,0 +1,5 @@
+/src/scripts/other/*
+.DS_Store*
+.Rhistory
+outputs/*
+data.zip

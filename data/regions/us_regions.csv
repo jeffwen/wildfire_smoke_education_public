@@ -1,0 +1,60 @@
+﻿epa_region,stateabb,region,fips
+Region 1,CT,Northeast,9
+Region 1,ME,Northeast,23
+Region 1,MA,Northeast,25
+Region 1,NH,Northeast,33
+Region 1,RI,Northeast,44
+Region 1,VT,Northeast,50
+Region 2,NJ,Northeast,34
+Region 2,NY,Northeast,36
+Region 2,Puerto Rico,Other,72
+Region 2,U.S. Virgin Islands,Other,78
+Region 3,DE,South,10
+Region 3,DC,South,11
+Region 3,MD,South,24
+Region 3,PA,Northeast,42
+Region 3,VA,South,51
+Region 3,WV,South,54
+Region 4,AL,South,1
+Region 4,FL,South,12
+Region 4,GA,South,13
+Region 4,KY,South,21
+Region 4,MS,South,28
+Region 4,NC,South,37
+Region 4,SC,South,45
+Region 4,TN,South,47
+Region 5,IL,Midwest,17
+Region 5,IN,Midwest,18
+Region 5,MI,Midwest,26
+Region 5,MN,Midwest,27
+Region 5,OH,Midwest,39
+Region 5,WI,Midwest,55
+Region 6,AR,South,5
+Region 6,LA,South,22
+Region 6,NM,West,35
+Region 6,OK,South,40
+Region 6,TX,South,48
+Region 7,IA,Midwest,19
+Region 7,KS,Midwest,20
+Region 7,MO,Midwest,29
+Region 7,NE,Midwest,31
+Region 8,CO,West,8
+Region 8,MT,West,30
+Region 8,ND,Midwest,38
+Region 8,SD,Midwest,46
+Region 8,UT,West,49
+Region 8,WY,West,56
+Region 9,AZ,West,4
+Region 9,CA,West,6
+Region 9,HI,West,15
+Region 9,NV,West,32
+Region 9,American Samoa,Other,60
+Region 9,Commonwealth of the Northern Mariana Islands,Other,69
+Region 9,Federated States of Micronesia,Other,64
+Region 9,Guam,Other,66
+Region 9,Marshall Islands,Other,68
+Region 9,Republic of Palau,Other,70
+Region 10,AK,West,2
+Region 10,ID,West,16
+Region 10,OR,West,41
+Region 10,WA,West,53

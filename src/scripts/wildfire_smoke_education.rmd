@@ -1,0 +1,1579 @@
+---
+title: "Wildfire smoke education"
+author: "Jeff Wen"
+date: "6/21/2022"
+output: html_document
+---
+
+```{r setup}
+## set working directory 
+knitr::opts_knit$set(root.dir = "~/Stanford/projects/wildfire_smoke_education_natsustain", warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(root.dir = "~/Stanford/projects/wildfire_smoke_education_natsustain", warning = FALSE, message = FALSE)
+
+```
+
+```{r load_packages}
+library(fixest)
+library(lme4)
+library(dplyr)
+library(data.table)
+library(ggthemes)
+library(ggplot2)
+library(cowplot)
+library(sf)
+library(lubridate)
+library(stringr)
+library(pbmcapply)
+library(pbapply)
+library(modelsummary)
+
+library(grid)
+library(png)
+
+## helper functions
+source("src/scripts/main_helper.R")
+
+DATA_PATH <- "data/"
+DEFAULT_COLOR <- "#737373"
+LINE_COLOR <- "#528fad"
+
+base_theme <- 
+  theme_classic(base_size = 15) + 
+  theme(
+    panel.spacing = unit(1, "lines"),
+    axis.title.x = element_text(color=DEFAULT_COLOR),
+    axis.title.y = element_text(color=DEFAULT_COLOR),
+    axis.line = element_line(color=DEFAULT_COLOR, size=0.25),
+    axis.text.x = element_text(color=DEFAULT_COLOR), 
+    axis.text.y = element_text(color=DEFAULT_COLOR),
+    axis.ticks = element_line(color=DEFAULT_COLOR, size=0.25), 
+    legend.text = element_text(color=DEFAULT_COLOR),
+    legend.title = element_text(color=DEFAULT_COLOR),
+    plot.subtitle = element_text(color=DEFAULT_COLOR),
+    strip.background = element_rect(color=DEFAULT_COLOR, fill=NA, size=0.5),
+    strip.text = element_text(color=DEFAULT_COLOR)
+  )
+
+## print loaded packages with verison 
+installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+```
+
+## Data loading
+
+```{r data_loading}
+######### Data loading ######### 
+## load main data files
+dist <- st_read('data/district/dist_small.shp')
+dist$extracted_fips <- lapply(dist$GEOID, function(x){substr(x, start=1, stop=2)}) %>% unlist() %>% as.integer()
+
+## load seda test score data
+seda_data <- readRDS('data/seda/seda_data.rds')
+
+## load saved smoke overlap data
+smoke_overlap_dt <- readRDS('data/smoke/smoke_overlap_dt.rds')
+
+## load region data 
+region_mapping <- read.csv('data/regions/us_regions.csv') %>% arrange(region, stateabb)
+
+## load smoke PM data by day
+dist_year_smoke_pm <- readRDS('data/clean/main_dist_year_smoke_pm.rds')
+
+## load main analysis data
+combined_pm_data_final <- readRDS('data/clean/main_combined_pm_data_final.rds')
+ANALYSIS_DF <- combined_pm_data_final
+```
+
+
+## Figure 1a: Descriptive plots (smoke day)
+
+```{r fig_1a}
+## states to drop (just keep continental)
+drop_states <- c(60,66,69,72,78,15,2)
+
+## data processing ##
+## aggregate education data for figure 1 overview
+seda_avg <- seda_data %>%
+  group_by(GEOID, fips, stateabb) %>% 
+  summarize(ela_avg=sum((totgyb_all_ela/sum(totgyb_all_ela, na.rm=T))*mn_all_ela, na.rm=T),
+            math_avg=sum((totgyb_all_math/sum(totgyb_all_math, na.rm=T))*mn_all_math, na.rm=T),
+            score_avg=ifelse(ela_avg==0, 
+                             ifelse(math_avg==0, 
+                                    NA, 
+                                    (totgyb_all_math/sum(totgyb_all_math, na.rm=T))*mn_all_math),
+                             ifelse(math_avg==0, 
+                                    (totgyb_all_ela/sum(totgyb_all_ela, na.rm=T))*mn_all_ela, 
+                                    sum((totgyb_all_ela/sum(totgyb_all_ela, totgyb_all_math, na.rm=T))*mn_all_ela,
+                                        (totgyb_all_math/sum(totgyb_all_ela, totgyb_all_math, na.rm=T))*mn_all_math, na.rm=T)
+                             )
+            )
+  )
+
+total_smoke_overlap <- smoke_overlap_dt %>% 
+  tidyr::drop_na(geoid) %>% 
+  mutate(year=year(date),
+         month=month(date), 
+         seda_year=ifelse(month%in%c(1:5), year(date),year(date)+1)) %>% 
+  filter(date>"2008-06-30" & date<"2017-07-01") %>% 
+  group_by(geoid, year) %>% 
+  summarize(smoke_days=sum((smoke_overlaps>0), na.rm=TRUE)) %>% 
+  group_by(geoid) %>% 
+  summarize(smoke_days=mean(smoke_days, na.rm=TRUE))
+
+joined_smoke <- dist[c("GEOID","geometry", "extracted_fips")] %>%
+  tidyr::drop_na(GEOID) %>%
+  left_join(total_smoke_overlap, by=c("GEOID"="geoid")) %>% 
+  left_join(seda_avg, by="GEOID") %>% ## keep observations not in SEDA data otherwise there are empty districts
+  filter(fips%in%drop_states==F, extracted_fips%in%drop_states==F)
+
+joined_smoke$smoke_days[is.na(joined_smoke$smoke_days)]<-0
+
+num_classes = 6
+joined_smoke$overlap_bucket <- cut(joined_smoke$smoke_days, 
+                                   quantile(joined_smoke$smoke_days, 
+                                            prob=seq(0, 1, length = num_classes+1), 
+                                            type=5), 
+                                   include.lowest=TRUE, dig.lab=10)
+joined_smoke$score_bucket <- cut(joined_smoke$score_avg, 
+                                 quantile(joined_smoke$score_avg, 
+                                          prob=seq(0, 1, length = num_classes), ## one less to account for nulls
+                                          type=5, na.rm=T), 
+                                 include.lowest=TRUE, dig.lab=10)
+
+
+SMOKE_COLOR_PALETTE <- viridisLite::magma(n=num_classes, alpha=0.9, begin=0.1, end=0.9, direction=-1)
+FONT_SCALING <- 0.7
+
+par(mar = c(2, 2, 2, 2), # Dist' from plot to side of page
+    mgp = c(1, 0.4, 0), # Dist' plot to label
+    ps = 14, cex = 1*FONT_SCALING, cex.main = 1*FONT_SCALING, # set the default font size to 12
+    las = 1, # Rotate y-axis text
+    tck = -.01, # Reduce tick length
+    xaxs = "i", yaxs = "i",
+    col=DEFAULT_COLOR) # Remove plot padding
+
+## save map as bitmap file
+png(file='outputs/fig_1a.png',width=1976,height=1142)
+
+plot(joined_smoke["overlap_bucket"],
+     col=(SMOKE_COLOR_PALETTE)[joined_smoke$overlap_bucket],
+     border="gray90", lwd=0.02, main="")
+
+dev.off()
+
+## create PDF from bitmap and legend as vector
+grDevices::cairo_pdf(file='outputs/fig_1a.pdf',width=9.5,height=5.5, pointsize=14)
+
+plot.new()
+
+grid.draw(rasterGrob(readPNG("outputs/fig_1a.png", native = FALSE),interpolate = FALSE))
+
+## district/smoke legend
+l=legend("bottomleft",
+         legend = dataPercentileLabeler(levels(joined_smoke$overlap_bucket)),
+         text.col = DEFAULT_COLOR,
+         fill = SMOKE_COLOR_PALETTE,
+         border=NA,
+         bty = "n", # turn off the legend border
+         cex = 1.1*FONT_SCALING,
+         inset=c(-0.07,-0.3),
+         xpd=TRUE,
+         xjust=1,
+         yjust=0
+) # decrease the font / legend size
+
+text(x=l$rect$left*(1/1.2), y=l$rect$top*2, 
+     "Average number of days\nper year with smoke overhead", 
+     col=DEFAULT_COLOR, 
+     #adj=c(0,1),
+     xpd=TRUE,
+     adj=0,
+     cex=1.1*FONT_SCALING)
+
+dev.off()
+```
+
+## Figure 1c: Descriptive plots (scores)
+
+```{r fig_1c}
+num_classes = 6
+SCORE_COLOR_PALETTE <- viridisLite::cividis(n=num_classes, alpha=0.9, begin=0.1, end=0.9)
+NA_COLOR <- "gray90"
+FONT_SCALING <- 0.7
+
+par(mar = c(2, 2, 2, 2), # Dist' from plot to side of page
+    mgp = c(1, 0.4, 0), # Dist' plot to label
+    ps = 12, cex = 1*FONT_SCALING, cex.main = 1*FONT_SCALING, # set the default font size to 12
+    las = 1, # Rotate y-axis text
+    tck = -.01, # Reduce tick length
+    xaxs = "i", yaxs = "i",
+    col=DEFAULT_COLOR) # Remove plot padding
+
+## save map as bitmap file
+png(file='outputs/fig_1c.png',width=1976,height=1142)
+
+## first plot the nulls
+plot(joined_smoke[is.na(joined_smoke["score_bucket"]),]["score_bucket"],
+     col=NA_COLOR,
+     border=NA_COLOR, lwd=0.02, main="", reset=F)
+
+plot(joined_smoke["score_bucket"],
+     col=(SCORE_COLOR_PALETTE)[joined_smoke$score_bucket],
+     border="gray90", lwd=0.02, main="", add=T)
+
+dev.off()
+
+
+## create PDF from bitmap and legend as vector
+grDevices::cairo_pdf(file='outputs/fig_1c.pdf',width=9.5,height=5.5, pointsize=14)
+
+plot.new()
+
+grid.draw(rasterGrob(readPNG("outputs/fig_1c.png", native = FALSE),interpolate = FALSE))
+
+## district/smoke legend
+l=legend("bottomleft",
+         legend = c("NA", dataPercentileLabeler(levels(joined_smoke$score_bucket), round_digits=2)),
+         text.col = DEFAULT_COLOR,
+         fill = c(NA_COLOR, SCORE_COLOR_PALETTE),
+         border=NA,
+         bty = "n", # turn off the legend border
+         cex = 1.1*FONT_SCALING,
+         inset=c(-0.07,-0.3),
+         xpd=TRUE,
+         xjust=1,
+         yjust=0
+) # decrease the font / legend size
+text(x=l$rect$left*(1/1.2), y=l$rect$top*2, 
+     "Average test\nscore (stdev)",
+     col=DEFAULT_COLOR,
+     xpd=TRUE,
+     adj=0,
+     cex=1.1*FONT_SCALING)
+
+dev.off()
+```
+
+## Figure 1b & d: Descriptive plots (trends)
+```{r fig_1b-d}
+## figure 1 trend plot (avg) grade trends
+fig1_smoke_avg_trend <- smoke_overlap_dt %>% 
+  tidyr::drop_na(geoid) %>% 
+  filter(date>"2008-12-31" & date<"2016-06-01") %>%
+  mutate(year=lubridate::year(date),
+         month=lubridate::month(date),
+         seda_year=as.integer(ifelse(month%in%c(1:5), year(date),year(date)+1)),
+         fips=as.integer(stringr::str_sub(geoid, 1, 2))) %>% 
+  group_by(geoid, fips, seda_year) %>%
+  summarize(smoke_days=sum((smoke_overlaps>0), na.rm=T)) %>%
+  left_join(region_mapping, by=c("fips")) %>%
+  group_by(region, seda_year) %>%
+  summarize(avg_smoke_days=mean(smoke_days, na.rm=T)) %>%
+  arrange(region, seda_year) %>% 
+  filter(region != "Other")
+
+## for single avg line
+fig1_smoke_avg_all_trend <- fig1_smoke_avg_trend %>% 
+  group_by(seda_year) %>% 
+  summarize(avg=mean(avg_smoke_days, na.rm=T))
+
+## for individual grade trends 
+fig1_seda_avg_trend <- seda_data %>% 
+  filter(year<2017) %>% 
+  select(GEOID, fips, stateabb, grade, year, mn_all_math, mn_all_ela, totgyb_all_ela, totgyb_all_math, cohort_start) %>%
+  group_by(grade, year) %>% 
+  summarize(ela_avg=sum((totgyb_all_ela/sum(totgyb_all_ela, na.rm=T))*mn_all_ela, na.rm=T),
+            math_avg=sum((totgyb_all_math/sum(totgyb_all_math, na.rm=T))*mn_all_math, na.rm=T),
+  ) %>%
+  ungroup() %>%
+  tidyr::pivot_longer(-c(grade, year), names_to="subject", values_to="avg") %>% 
+  tidyr::separate(subject, into=c("subject","type"), sep="[_]") %>%
+  select(-c("type")) %>%
+  mutate(grade=ordered(grade, levels=c(3:8)),
+         subject=ifelse(subject=="ela","ELA","Math"))
+
+## for single avg line
+fig1_seda_avg_all_trend <- seda_data %>% 
+  filter(year<2017) %>% 
+  group_by(year) %>% 
+  summarize(ela_avg=sum((totgyb_all_ela/sum(totgyb_all_ela, na.rm=T))*mn_all_ela, na.rm=T),
+            math_avg=sum((totgyb_all_math/sum(totgyb_all_math, na.rm=T))*mn_all_math, na.rm=T),
+  ) %>%
+  tidyr::pivot_longer(-c(year), names_to="subject", values_to="avg") %>% 
+  tidyr::separate(subject, into=c("subject","type"), sep="[_]") %>%
+  select(-c("type")) %>%
+  mutate(subject=ifelse(subject=="ela","ELA","Math"))
+
+## format labels
+fig1_smoke_avg_trend <- fig1_smoke_avg_trend %>% 
+  mutate(label_add_x=ifelse(region=="Midwest", 
+                            .1, 
+                            ifelse(region=="West", 
+                                   0, 
+                                   ifelse(region=="Northeast", 
+                                          0, 
+                                          ifelse(region=="South", 
+                                                 .1)
+                                   )
+                            )
+  ),
+  label_add_y=ifelse(region=="Midwest", 
+                     5, 
+                     ifelse(region=="West", 
+                            -3, 
+                            ifelse(region=="Northeast", 
+                                   -3, 
+                                   ifelse(region=="South", 
+                                          5)
+                            )
+                     )
+  )
+  )
+
+## average smoke trends
+p4 <- ggplot(data=fig1_smoke_avg_trend, aes(x=seda_year, y=avg_smoke_days)) +
+  geom_line(aes(group=region), size=0.5, alpha=0.25) +
+  geom_line(data=fig1_smoke_avg_all_trend, aes(x=seda_year, y=avg), size=0.5) +
+  geom_text(data = fig1_smoke_avg_trend %>% filter(seda_year == 2014), aes(label = region, 
+                                                                           x = seda_year + label_add_x, 
+                                                                           y = avg_smoke_days + label_add_y),
+            color=DEFAULT_COLOR, size=4.5) + 
+  base_theme +
+  labs(x="School year", y="Average smoke days") + 
+  scale_x_continuous(breaks=c(2009:2016))
+
+ggsave('outputs/fig_1b.pdf', plot=p4, width = 7, height = 5.5)
+# ggsave('outputs/fig_1b.pdf', plot=p4, width = 5, height = 3.8)
+
+## average score trends
+p5 <- ggplot(data=fig1_seda_avg_trend, aes(x=year, y=avg)) +
+  geom_hline(yintercept = 0, color = DEFAULT_COLOR, lty = 2, size=0.3) +
+  geom_line(aes(group=interaction(grade, subject), color=subject), size=0.5, alpha=0.15) +
+  geom_line(data=fig1_seda_avg_all_trend, aes(x=year, y=avg, color=subject), size=0.5) + 
+  base_theme +  
+  theme(
+    legend.position = c(1, 0.1),
+    legend.direction = "horizontal",
+    legend.justification = "right"
+  ) + 
+  labs(x="School year", y="Average test performance (stdev)", color="Subject") +
+  scale_color_manual(values=c("#23ba20", "#2072ba")) + 
+  scale_x_continuous(breaks=c(2009:2016))
+
+ggsave('outputs/fig_1d.pdf', plot=p5, width = 7, height = 5.5)
+# ggsave('outputs/fig_1d.pdf', plot=p5, width = 5, height = 3.8)
+```
+
+
+## Figure 2a: Response functions
+
+```{r fig_2a}
+TEMP_ANALYSIS_DF <- ANALYSIS_DF %>% 
+  mutate(smokePM_anom_total_2=smokePM_anom_total**2,
+         smokePM_anom_total_3=smokePM_anom_total**3,
+         smokePM_anom_school_total_2=smokePM_anom_school_total**2,
+         smokePM_anom_school_total_3=smokePM_anom_school_total**3,
+         smokePM_anom_nonschool_total_2=smokePM_anom_nonschool_total**2,
+         smokePM_anom_nonschool_total_3=smokePM_anom_nonschool_total**3
+  )
+
+MEAN_SCORE <- mean(TEMP_ANALYSIS_DF$avg_score_unweighted, na.rm=T)
+N <- 1000
+SCHOOL_SMOKE_TOTAL_RANGE <- quantile(TEMP_ANALYSIS_DF$smokePM_anom_school_total, na.rm=T, probs=c(0.01,0.99))
+SCHOOL_SMOKE_TOTAL_RANGE <- c(SCHOOL_SMOKE_TOTAL_RANGE[[1]]:SCHOOL_SMOKE_TOTAL_RANGE[[2]])
+MEAN_NONSCHOOL_TOTAL <- mean(TEMP_ANALYSIS_DF$smokePM_anom_nonschool_total, na.rm=T)
+MID_IDX <- 1
+
+## run bootstraps
+coef_list <- getBootstrapAvg(TEMP_ANALYSIS_DF, n=N,
+                             x="smokePM_anom_school_total + smokePM_anom_nonschool_total",
+                             ctrls="tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt", 
+                             fe="GEOID + year_grade", 
+                             cluster="county_fips")
+coef_2_list <- getBootstrapAvg(TEMP_ANALYSIS_DF, n=N,
+                               x="smokePM_anom_school_total + smokePM_anom_school_total_2 + 
+                               smokePM_anom_nonschool_total + smokePM_anom_nonschool_total_2",
+                               ctrls="tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt", 
+                               fe="GEOID + year_grade", 
+                               cluster="county_fips")
+coef_3_list <- getBootstrapAvg(TEMP_ANALYSIS_DF, n=N,
+                               x="smokePM_anom_school_total + smokePM_anom_school_total_2 + smokePM_anom_school_total_3 +
+                               smokePM_anom_nonschool_total + smokePM_anom_nonschool_total_2 + smokePM_anom_nonschool_total_3",
+                               ctrls="tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt", 
+                               fe="GEOID + year_grade", 
+                               cluster="county_fips")
+
+## generate range of estimates for linear
+input_df <- data.frame(smokePM_anom_school_total = c(SCHOOL_SMOKE_TOTAL_RANGE), 
+                       mean_nonschool_total = MEAN_NONSCHOOL_TOTAL,
+                       tm0 = mean(TEMP_ANALYSIS_DF$tm0, na.rm=T),
+                       tm0_10 = mean(TEMP_ANALYSIS_DF$tm0_10, na.rm=T),
+                       tm10_20 = mean(TEMP_ANALYSIS_DF$tm10_20, na.rm=T),
+                       tm20_30 = mean(TEMP_ANALYSIS_DF$tm20_30, na.rm=T),
+                       tm30_40 = mean(TEMP_ANALYSIS_DF$tm30_40, na.rm=T),
+                       tm40_50 = mean(TEMP_ANALYSIS_DF$tm40_50, na.rm=T),
+                       tm50_60 = mean(TEMP_ANALYSIS_DF$tm50_60, na.rm=T),
+                       tm70_80 = mean(TEMP_ANALYSIS_DF$tm70_80, na.rm=T),
+                       tm80p = mean(TEMP_ANALYSIS_DF$tm80p, na.rm=T),
+                       total_ppt = mean(TEMP_ANALYSIS_DF$total_ppt, na.rm=T))
+result_df <- genRangeEstimateNew(coef_list, SCHOOL_SMOKE_TOTAL_RANGE, input_df)
+
+input_2_df <- data.frame(smokePM_anom_school_total = c(SCHOOL_SMOKE_TOTAL_RANGE), 
+                         smokePM_anom_school_total_2 = c(SCHOOL_SMOKE_TOTAL_RANGE)**2, 
+                         mean_nonschool_total = MEAN_NONSCHOOL_TOTAL,
+                         mean_nonschool_total_2 = MEAN_NONSCHOOL_TOTAL**2,
+                         tm0 = mean(TEMP_ANALYSIS_DF$tm0, na.rm=T),
+                         tm0_10 = mean(TEMP_ANALYSIS_DF$tm0_10, na.rm=T),
+                         tm10_20 = mean(TEMP_ANALYSIS_DF$tm10_20, na.rm=T),
+                         tm20_30 = mean(TEMP_ANALYSIS_DF$tm20_30, na.rm=T),
+                         tm30_40 = mean(TEMP_ANALYSIS_DF$tm30_40, na.rm=T),
+                         tm40_50 = mean(TEMP_ANALYSIS_DF$tm40_50, na.rm=T),
+                         tm50_60 = mean(TEMP_ANALYSIS_DF$tm50_60, na.rm=T),
+                         tm70_80 = mean(TEMP_ANALYSIS_DF$tm70_80, na.rm=T),
+                         tm80p = mean(TEMP_ANALYSIS_DF$tm80p, na.rm=T),
+                         total_ppt = mean(TEMP_ANALYSIS_DF$total_ppt, na.rm=T))
+result_2_df <- genRangeEstimateNew(coef_2_list, SCHOOL_SMOKE_TOTAL_RANGE, input_2_df)
+
+input_3_df <- data.frame(smokePM_anom_school_total = c(SCHOOL_SMOKE_TOTAL_RANGE), 
+                         smokePM_anom_school_total_2 = c(SCHOOL_SMOKE_TOTAL_RANGE)**2,  
+                         smokePM_anom_school_total_3 = c(SCHOOL_SMOKE_TOTAL_RANGE)**3,  
+                         mean_nonschool_total = MEAN_NONSCHOOL_TOTAL,
+                         mean_nonschool_total_2 = MEAN_NONSCHOOL_TOTAL**2,
+                         mean_nonschool_total_3 = MEAN_NONSCHOOL_TOTAL**3,
+                         tm0 = mean(TEMP_ANALYSIS_DF$tm0, na.rm=T),
+                         tm0_10 = mean(TEMP_ANALYSIS_DF$tm0_10, na.rm=T),
+                         tm10_20 = mean(TEMP_ANALYSIS_DF$tm10_20, na.rm=T),
+                         tm20_30 = mean(TEMP_ANALYSIS_DF$tm20_30, na.rm=T),
+                         tm30_40 = mean(TEMP_ANALYSIS_DF$tm30_40, na.rm=T),
+                         tm40_50 = mean(TEMP_ANALYSIS_DF$tm40_50, na.rm=T),
+                         tm50_60 = mean(TEMP_ANALYSIS_DF$tm50_60, na.rm=T),
+                         tm70_80 = mean(TEMP_ANALYSIS_DF$tm70_80, na.rm=T),
+                         tm80p = mean(TEMP_ANALYSIS_DF$tm80p, na.rm=T),
+                         total_ppt = mean(TEMP_ANALYSIS_DF$total_ppt, na.rm=T))
+result_3_df <- genRangeEstimateNew(coef_3_list, SCHOOL_SMOKE_TOTAL_RANGE, input_3_df)
+
+## calculate confidence interval
+ci_df <- result_df %>% 
+  group_by(x, subject) %>% 
+  summarize(l_95=quantile(y,0.05), 
+            m=quantile(y,0.5), 
+            u_95=quantile(y,0.95))
+
+ci_2_df <- result_2_df %>% 
+  group_by(x, subject) %>% 
+  summarize(l_95=quantile(y,0.05), 
+            m=quantile(y,0.5), 
+            u_95=quantile(y,0.95))
+
+ci_3_df <- result_3_df %>%
+  group_by(x, subject) %>%
+  summarize(l_95=quantile(y,0.05),
+            m=quantile(y,0.5),
+            u_95=quantile(y,0.95))
+
+## calculate margin histogram details
+smoke_hist <- TEMP_ANALYSIS_DF %>% 
+  select(smokePM_anom_school_total) %>% 
+  filter(!is.na(smokePM_anom_school_total), 
+         smokePM_anom_school_total>SCHOOL_SMOKE_TOTAL_RANGE[[1]],
+         smokePM_anom_school_total<SCHOOL_SMOKE_TOTAL_RANGE[[length(SCHOOL_SMOKE_TOTAL_RANGE)]]) %>%
+  mutate(smokePM_anom_school_total=round(smokePM_anom_school_total)) %>% 
+  group_by(smokePM_anom_school_total) %>% 
+  summarise(n = n()) %>%
+  mutate(height = 0.1*n/sum(n), breaks=smokePM_anom_school_total-0.25) 
+
+## start main plotting
+YMIN <- quantile(ci_3_df$l_95, na.rm=T, probs=c(0.2))
+
+p1 <- ggplot(data=ci_df, aes(x=x, y=m, group=subject)) +
+  base_theme + 
+  theme(
+    text=element_text(size=14),
+    legend.position = "bottom",
+    legend.margin=margin(t=-10)
+  ) +
+  geom_line(aes(linetype="Linear"), color=LINE_COLOR, show.legend=T, size=0.25) +
+  geom_line(data=ci_2_df, aes(linetype="Quadratic"), color=LINE_COLOR, show.legend=T, alpha=0.4, size=0.25) +
+  geom_line(data=ci_3_df, aes(linetype="Cubic"), color=LINE_COLOR, show.legend=T, alpha=0.4, size=0.25) +
+  geom_ribbon(data=ci_df,aes(x=x, ymin=l_95, ymax=u_95, fill=subject), alpha=0.2, show.legend=FALSE) + 
+  labs(y=expression(Delta~" Average test performance (% of stdev)"), x="Total accumulated school day smoke PM2.5", linetype="") + 
+  ylim(YMIN, NA) + 
+  geom_hline(yintercept = 0, color = DEFAULT_COLOR, lty = 2, size=0.25) +
+  geom_rect(data=smoke_hist, aes(xmin=smokePM_anom_school_total-0.475, xmax=smokePM_anom_school_total+.475, 
+                                 ymin=YMIN, ymax=YMIN+height), fill=DEFAULT_COLOR,
+            alpha=0.4, inherit.aes=F) + 
+  coord_cartesian(xlim =quantile(TEMP_ANALYSIS_DF$smokePM_anom_school_total, na.rm=T, probs=c(0.01,0.975)), ylim=c(YMIN, NA), expand=F) +
+  scale_color_manual(name="", values=c(LINE_COLOR)) +
+  scale_fill_manual(values=c(LINE_COLOR), guide="none") +
+  scale_linetype_manual(values=c("Linear"=1, "Quadratic"=2, "Cubic"=3)) +
+  scale_y_continuous(labels=scales::percent_format(accuracy=.1, suffix=""))
+
+ggsave('outputs/fig_2a.pdf', plot=p1, width=8, height=6)
+```
+
+## Figure 2b: coefficient plot 
+
+```{r fig_2b}
+ANALYSIS_DF <- ANALYSIS_DF %>% 
+  mutate(grade_bucket=as.factor(ifelse(grade%in%c(3:5), "primary", "secondary")))
+
+## smoke PM cumulative
+mod_avg_0 <- feols(avg_score_unweighted~smokePM_anom_total + 
+                     tm0 + 
+                     tm0_10 + 
+                     tm10_20 + 
+                     tm20_30 + 
+                     tm30_40 + 
+                     tm40_50 + 
+                     tm50_60 + 
+                     tm70_80 + 
+                     tm80p + 
+                     total_ppt|GEOID + year_grade, 
+                   cluster='county_fips',
+                   weights=ANALYSIS_DF$avg_student_population,
+                   data=ANALYSIS_DF)$coeftable
+
+mod_ela_1 <- feols(mn_all_ela~smokePM_anom_total + tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + 
+                     tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                   cluster='county_fips',
+                   weights=ANALYSIS_DF$totgyb_all_ela,
+                   data=ANALYSIS_DF)$coeftable
+mod_math_1 <- feols(mn_all_math~smokePM_anom_total + tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + 
+                      tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                    cluster='county_fips',
+                    weights=ANALYSIS_DF$totgyb_all_math,
+                    data=ANALYSIS_DF)$coeftable
+
+mod_avg_2 <- feols(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total + 
+                     tm0 + 
+                     tm0_10 + 
+                     tm10_20 + 
+                     tm20_30 + 
+                     tm30_40 + 
+                     tm40_50 + 
+                     tm50_60 + 
+                     tm70_80 + 
+                     tm80p + 
+                     total_ppt|GEOID + year_grade, 
+                   cluster='county_fips',
+                   weights=ANALYSIS_DF$avg_student_population,
+                   data=ANALYSIS_DF)$coeftable
+
+## wald test of coeff equivalence using lfe
+temp_mod_avg <- lfe::felm(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total + tm0 + tm0_10 + tm10_20 + tm20_30 + 
+                            tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade|0|county_fips, 
+                          weights=ANALYSIS_DF$avg_student_population,
+                          data=ANALYSIS_DF)
+lfe::waldtest(temp_mod_avg,~smokePM_anom_school_total-smokePM_anom_nonschool_total)
+
+mod_list <- list("mod_avg_0"=mod_avg_0,
+                 "mod_ela_1"=mod_ela_1, "mod_math_1"=mod_math_1,
+                 "mod_avg_2"=mod_avg_2
+)
+
+mod_df <- do.call(rbind, mod_list) %>% mutate(row_names=rownames(.)) %>% 
+  tidyr::separate(row_names, into=c("mod_name","var"), sep="[.]") %>% 
+  filter(grepl("^smokePM", var)) %>% 
+  tidyr::separate(mod_name, into=c("mod","subject", "run"), sep="[_]") %>% 
+  select(-c(mod)) %>% 
+  rename(est=Estimate, se=`Std. Error`, t_val=`t value`, p_val=`Pr(>|t|)`) %>% 
+  mutate(var = case_when(((var == "smokePM_anom_total") & (subject == "ela")) ~ "ELA",
+                         ((var == "smokePM_anom_total") & (subject == "math")) ~ "Math",
+                         ((var == "smokePM_anom_total") & (subject == "avg")) ~ "Combined effect",
+                         var == "smokePM_anom_nonschool_total" ~ "Non-school",
+                         var == "smokePM_anom_school_total" ~ "School"),
+         var = ordered(var, levels=c("Combined effect",
+                              "ELA","Math",
+                              "Non-school", "School")),
+  run = c(rep(c("Cumulative\nsmoke PM2.5"), times=1),
+          rep(c("ELA vs. Math"), times=2),
+          rep(c("School vs. non-school"), times=2)))
+
+p2_10 <- ggplot(data=mod_df %>%  mutate(est=est*10, se=se*10), aes(color=subject)) + 
+  base_theme + 
+  theme(
+    legend.position = "none"
+  ) + 
+  geom_hline(yintercept = 0, colour = DEFAULT_COLOR, lty = 2, size=0.25) + 
+  geom_linerange(aes(x=var, ymin=est-qnorm(0.975)*se, ymax=est+qnorm(0.975)*se),lwd=0.25,position=position_dodge2(width=.25), color=LINE_COLOR) + 
+  geom_point(aes(x=var, y=est), position=position_dodge2(width=.25), shape = 21, fill = "WHITE", color=LINE_COLOR) + 
+  labs(y=expression(atop(Delta~" Test performance per", "10"~mu*"g m"^"-3"~"(% of stdev)")), x="", color="Subject") + 
+  facet_grid(~run, scales="free_x", space="free_x") + 
+  scale_y_continuous(labels=scales::percent_format(accuracy=.01, suffix=""))
+
+ggsave('outputs/fig_2b_10.pdf', plot=p2_10, width=8, height=3.1)
+```
+
+## Figure 2c: Fixest randomization test 
+
+```{r fig_2c}
+TREATMENT_VAR <- 'smokePM_anom_school_total'
+
+fixe_avg <- feols(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total + tm0 + tm0_10 + tm10_20 + tm20_30 + 
+                    tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade,
+                  cluster='county_fips',
+                  weights=ANALYSIS_DF$avg_student_population,
+                  data=ANALYSIS_DF)
+
+start_time <- Sys.time()
+result_df <- pbmclapply(1:1000, permTest, 
+                        outcome=c("avg_score_unweighted"),
+                        rhs="smokePM_anom_school_total + smokePM_anom_nonschool_total + 
+                             tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 +
+                             tm80p + total_ppt|GEOID + year_grade", 
+                        data=ANALYSIS_DF, 
+                        treatment=TREATMENT_VAR,
+                        sample_group="county_fips") %>%
+  bind_rows()
+end_time <- Sys.time()
+end_time-start_time
+
+# 10 ug
+fig2_p2_10 <- ggplot(data=result_df %>% mutate(coef=coef*10), aes(color=subject)) + 
+  base_theme +
+  theme(
+    legend.position="none",
+  ) + 
+  geom_histogram(aes(x=coef, fill=subject), bins=35, alpha=0.3, position="identity", size=0.25) + 
+  geom_vline(xintercept=summary(fixe_avg)$coefficient[TREATMENT_VAR]*10, lty = 2, color=LINE_COLOR, size=0.25) +
+  annotate("text", x=summary(fixe_avg)$coefficient[TREATMENT_VAR]*10+0.000015, y=75, 
+           label = "Observed", color=DEFAULT_COLOR, angle=90) + 
+  coord_cartesian(xlim=c(-0.00055, 0.0003), ylim=c(0,150), expand=F) +
+  scale_fill_manual(values=c(LINE_COLOR)) +
+  scale_color_manual(values=c(LINE_COLOR)) +
+  labs(x=expression("Estimated coefficient per 10 "*mu*"g m"^"-3"~"(% of stdev)"), y="Frequency", fill="", color="") +
+  scale_x_continuous(labels=scales::percent_format(accuracy=.001, suffix=""))
+
+ggsave("outputs/fig_2c_10.pdf", plot=fig2_p2_10, width=8, height=3.1)
+```
+
+## Figure 3: heterogeneity
+
+```{r fig_3}
+## GRADE ##
+ANALYSIS_DF <- ANALYSIS_DF %>% 
+  mutate(grade_bucket=as.factor(ifelse(grade%in%c(3:5), "primary", "secondary")))
+
+mod_avg_0 <- feols(avg_score_unweighted~grade_bucket/smokePM_anom_school_total + grade_bucket/smokePM_anom_nonschool_total + tm0 + 
+                     tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade,
+                   cluster='county_fips',
+                   weights=ANALYSIS_DF$avg_student_population,
+                   data=ANALYSIS_DF)$coeftable
+
+mod_list <- list("mod_avg_0"=mod_avg_0)
+
+grade_mod_df <- do.call(rbind, mod_list) %>% mutate(row_names=rownames(.)) %>% 
+  tidyr::separate(row_names, into=c("mod_name","var"), sep="[.]") %>% 
+  filter(grepl("^grade_bucket(primary|secondary):smokePM", var)) %>% 
+  tidyr::separate(mod_name, into=c("mod","subject", "run"), sep="[_]") %>% 
+  tidyr::separate(var, into=c("temp1","moderator", "temp2", "temp3", "school","temp4"), sep="[:_]") %>% 
+  select(-c(mod, temp1, temp2, temp3, temp4)) %>% 
+  mutate(moderator=stringr::str_to_title(str_sub(moderator,7,-1))) %>% 
+  rename(est=Estimate, se=`Std. Error`, t_val=`t value`, p_val=`Pr(>|t|)`) %>% 
+  mutate(school = case_when(school == "school" ~ "School",
+                            school == "nonschool" ~ "Non-school"),
+         run="Primary vs. secondary school")
+row.names(grade_mod_df) <- NULL
+
+## ETHNICITY/ SES ##
+mod_avg_nonwht <- feols(avg_score_unweighted~perecd_bin/pernonwht_bin/smokePM_anom_school_total + 
+                          perecd_bin/pernonwht_bin/smokePM_anom_nonschool_total + tm0 + 
+                          tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade,
+                        cluster='county_fips',
+                        weights=ANALYSIS_DF$avg_student_population,
+                        data=ANALYSIS_DF)$coeftable
+
+mod_list <- list("mod_avg_nonwht"=mod_avg_nonwht)
+
+eth_ses_mod_df <- do.call(rbind, mod_list) %>% mutate(row_names=rownames(.)) %>% 
+  tidyr::separate(row_names, into=c("mod_name","var"), sep="[.]") %>% 
+  filter(grepl("^perecd_bin[[:alpha:]]{3,4}:pernonwht_bin[[:alpha:]]{3,4}:smokePM", var)) %>% 
+  tidyr::separate(mod_name, into=c("mod","subject", "run"), sep="[_]") %>% 
+  tidyr::separate(var, into=c("moderator1", "moderator2", "var"), sep="[:]") %>% 
+  tidyr::separate(var, into=c("temp1", "temp2", "school", "temp3"), sep="[_]") %>% 
+  select(-c(mod, run, temp1, temp2, temp3)) %>% 
+  rename(est=Estimate, se=`Std. Error`, t_val=`t value`, p_val=`Pr(>|t|)`) %>% 
+  mutate(school = case_when(school == "school" ~ "School",
+                            school == "nonschool" ~ "Non-school"),
+         moderator1 = case_when(moderator1 == "perecd_binHigh" ~ "High econ dis",
+                                moderator1 == "perecd_binLow" ~ "Low econ dis"),
+         moderator2 = case_when(moderator2 == "pernonwht_binHigh" ~ "High % non-White",
+                                moderator2 == "pernonwht_binLow" ~ "Low % non-White"),
+         moderator = paste0(moderator1,"\n",moderator2),
+         run=ifelse((moderator2=="High % non-White") | (moderator2=="Low % non-White"),
+                    "Race/ethnicity & Economic disadvantage: Non-White", 
+                    "Race/ethnicity & Economic disadvantage: Other")) %>% 
+  select(-c(moderator1, moderator2))
+row.names(eth_ses_mod_df) <- NULL
+
+## bring data together
+mod_df <- bind_rows(grade_mod_df, eth_ses_mod_df) %>% 
+  mutate(moderator= ordered(moderator, levels=c("Primary","Secondary",
+                                                "Low econ dis\nLow % non-White",
+                                                "Low econ dis\nHigh % non-White",
+                                                "High econ dis\nLow % non-White",
+                                                "High econ dis\nHigh % non-White")))
+
+## in 10 ug change units
+mod_10_df <- mod_df %>% filter(school=="School") %>% mutate(est=est*10, se=se*10)
+
+label_df <- data.frame(
+  label=c("Primary","Secondary",
+          "Low econ dis\nLow % non-White","Low econ dis\nHigh % non-White",
+          "High econ dis\nLow % non-White","High econ dis\nHigh % non-White"),
+  run=c("Primary vs. secondary school", "Primary vs. secondary school",
+        "Race/ethnicity & Economic disadvantage: Non-White","Race/ethnicity & Economic disadvantage: Non-White",
+        "Race/ethnicity & Economic disadvantage: Non-White","Race/ethnicity & Economic disadvantage: Non-White"),
+  y=c(mod_10_df %>% filter(moderator=="Primary") %>% mutate(y=est+qnorm(0.975)*se+0.00012) %>% pull(y),
+      mod_10_df %>% filter(moderator=="Secondary") %>% mutate(y=est+qnorm(0.975)*se+0.00012) %>% pull(y),
+      mod_10_df %>% filter(moderator=="Low econ dis\nLow % non-White") %>% mutate(y=est-qnorm(0.975)*se-0.0002) %>% pull(y),
+      mod_10_df %>% filter(moderator=="Low econ dis\nHigh % non-White") %>% mutate(y=est+qnorm(0.975)*se+0.00022) %>% pull(y),
+      mod_10_df %>% filter(moderator=="High econ dis\nLow % non-White") %>% mutate(y=est+qnorm(0.975)*se+0.00022) %>% pull(y),
+      mod_10_df %>% filter(moderator=="High econ dis\nHigh % non-White") %>% mutate(y=est-qnorm(0.975)*se-0.0002) %>% pull(y)),
+  subject="avg"
+)
+
+p3_10 <- ggplot(data=mod_10_df, aes(color=subject)) + 
+  base_theme + 
+  theme(
+    panel.spacing = unit(0.2, "lines"),
+    legend.position = "bottom",
+    axis.line.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+  ) + 
+  geom_hline(yintercept = 0, colour = DEFAULT_COLOR, lty = 2, size=0.25) + 
+  geom_linerange(aes(x=moderator, ymin=est-qnorm(0.975)*se, ymax=est+qnorm(0.975)*se),lwd=0.25, color=LINE_COLOR) + 
+  geom_point(aes(x=moderator, y=est), shape = 21, fill = "WHITE", color=LINE_COLOR) + 
+  labs(y=expression(Delta~" Test performance per 10"~mu*"g m"^"-3"~"(% of stdev)"), x="", alpha="Confidence level") + 
+  facet_grid(~run, scales="free_x", space="free_x") + 
+  scale_y_continuous(labels=scales::percent_format(accuracy=.01, suffix="")) + 
+  coord_cartesian(ylim=c(-.002,0.0015), expand=T) +
+  geom_text(data=label_df, mapping=aes(x=label, y=y, label=label), color=DEFAULT_COLOR)
+
+ggsave('outputs/fig_3_alt_10.pdf', plot=p3_10, width = 8, height = 5)
+```
+
+## Figure 4: Data processing
+
+```{r fig_4_data_processing}
+fixe_bin_avg <- feols(avg_score_unweighted~perecd_bin/pernonwht_bin/smokePM_anom_school_total + perecd_bin/pernonwht_bin/smokePM_anom_nonschool_total + 
+                        tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt| GEOID + year_grade, 
+                      cluster='county_fips',
+                      weights=ANALYSIS_DF$avg_student_population,
+                      data=ANALYSIS_DF)
+
+## calculate avg effects for all districts
+## smoke exposure for all districts
+drop_states <- c("60","66","69","72","78","15","02")
+smoke_pm_map_df <- dist_year_smoke_pm %>%
+  mutate(fips=str_sub(geoid,1,2)) %>% 
+  filter(fips%not_in%drop_states,
+         seda_year>=2009, seda_year<2017) %>% 
+  group_by(fips, geoid, seda_year) %>% 
+  summarize(smokePM_anom_school_total=mode(smokePM_anom_school_total),
+            smokePM_anom_nonschool_total=mode(smokePM_anom_nonschool_total)
+  ) %>% 
+  as.data.frame()
+
+## get perecd, pernonwht, total students for districts that have it and fill in blanks with most recent 
+hetero_med_df <- ANALYSIS_DF %>%
+  group_by(GEOID, year) %>% 
+  summarize(med_perecd=median(perecd, na.rm=T),
+            med_pernonwht=median(pernonwht, na.rm=T),
+            mode_perecd_bin=mode(perecd_bin),
+            mode_pernonwht_bin=mode(pernonwht_bin),
+            num_ela_students=sum(totgyb_all_ela, na.rm=T),
+            num_math_students=sum(totgyb_all_math, na.rm=T)) %>% 
+  mutate(year=as.integer(as.character(year))) %>% 
+  tidyr::complete(year=2009:2016) %>% 
+  tidyr::fill(med_perecd,med_pernonwht,mode_perecd_bin,mode_pernonwht_bin,num_ela_students,num_math_students, .direction = "downup")
+
+## CONVERT to dollars...
+chetty_conversion_rate <- 0.13 # 1sd teacher effect on test scores (in sd)
+
+# create sim for the different moderator bins
+NUM_SIMS <- 3000
+set.seed(42)
+hetero_levels <- expand.grid(ecd=c("Low","High"),
+                             nonwht=c("Low","High"), stringsAsFactors=F)
+
+# sample coefficient using mean and se from main regression
+hetero_sim_df <- lapply(1:nrow(hetero_levels), function(i){
+  coef_str <- paste0('perecd_bin', hetero_levels[[i, 'ecd']], ':pernonwht_bin', hetero_levels[[i, 'nonwht']],':smokePM_anom_school_total')
+  sim_vec <- rnorm(NUM_SIMS, summary(fixe_bin_avg)$coeftable[coef_str,'Estimate'], summary(fixe_bin_avg)$coeftable[coef_str,'Std. Error'])
+  
+  cbind(data.frame('perecd_bin'=hetero_levels[[i, 'ecd']],
+                   'pernonwht_bin'=hetero_levels[[i, 'nonwht']]),
+        sim_vec %>% t())
+  
+}) %>% bind_rows()
+
+## district level sim avg effect for moderators (base data used for fig 4 plots)
+sim_effects_df <- smoke_pm_map_df %>%
+  select(fips, geoid, seda_year, smokePM_anom_school_total, smokePM_anom_nonschool_total) %>% 
+  left_join(hetero_med_df, by=c("geoid"="GEOID", "seda_year"="year")) %>% 
+  mutate(tot_students=round((num_ela_students+num_math_students)/2,0)) %>%  # total num students is avg of math and ela test takers...)
+  left_join(hetero_sim_df, by=c("mode_perecd_bin"="perecd_bin", "mode_pernonwht_bin"="pernonwht_bin"))
+
+## district level sim avg dollar per student (convert avg effect to dollars using chetty conversion)
+sim_dollar_df <- sim_effects_df %>% 
+  mutate(across(.cols=as.character(1:NUM_SIMS), ~.x*smokePM_anom_school_total*100)) %>% # calc the avg_effect for each sim column
+  mutate(across(.cols=as.character(1:NUM_SIMS), ~(.x/100)*7000/chetty_conversion_rate)) %>%  # calc the avg_dollar per student for each sim
+  mutate(mode_perecd_bin = case_when(mode_perecd_bin == "High" ~ "High econ disadvantage",
+                                     mode_perecd_bin == "Low" ~ "Low econ disadvantage"),
+         mode_pernonwht_bin = case_when(mode_pernonwht_bin == "High" ~ "High % non-White",
+                                        mode_pernonwht_bin == "Low" ~ "Low % non-White"),
+         moderator = paste0(mode_perecd_bin,"\n",mode_pernonwht_bin),
+         moderator = ordered(moderator, levels=c("Low econ disadvantage\nLow % non-White",
+                                                 "Low econ disadvantage\nHigh % non-White",
+                                                 "High econ disadvantage\nLow % non-White",
+                                                 "High econ disadvantage\nHigh % non-White"))
+  ) %>% 
+  tidyr::drop_na(moderator)
+
+## MAP PLOTTING ##
+TEMP_ANALYSIS_DF_LONG <- smoke_pm_map_df %>%
+  select(fips, geoid, seda_year, smokePM_anom_school_total, smokePM_anom_nonschool_total) %>% 
+  left_join(hetero_med_df, by=c("geoid"="GEOID", "seda_year"="year")) %>% 
+  mutate(avg_effect=getcoef(summary(fixe_bin_avg)$coeftable, "perecd_bin", "pernonwht_bin", "smokePM_anom_school_total", mode_perecd_bin, mode_pernonwht_bin)*smokePM_anom_school_total*100,
+         se=getcoef(summary(fixe_bin_avg)$coeftable, "perecd_bin", "pernonwht_bin", "smokePM_anom_school_total", mode_perecd_bin, mode_pernonwht_bin, 'Std. Error'))
+
+## get district shapes
+drop_states <- c(60,66,69,72,78,15,2)
+dist_small <- dist[c("GEOID","geometry", "extracted_fips")] %>%
+  tidyr::drop_na(GEOID) %>%
+  filter(extracted_fips%not_in%drop_states)
+
+# finish setting up the mapping df
+smoke_pm_effect_plot_df_wide <- TEMP_ANALYSIS_DF_LONG %>% 
+  filter(seda_year%in%c(2011, 2016)) %>% 
+  tidyr::pivot_wider(id_cols=c("geoid"),
+                     names_from=seda_year,
+                     names_prefix = "avg_effect_",
+                     values_from=c("avg_effect"))
+
+## split avg effects into buckets for plotting
+num_classes <- 6 # num_classes <- 4 if doing the dot sig alternative map
+smoke_pm_effect_plot_df_wide$avg_effect_2011_bucket <- cut(smoke_pm_effect_plot_df_wide$avg_effect_2011, 
+                                                           quantile(c(smoke_pm_effect_plot_df_wide$avg_effect_2011, smoke_pm_effect_plot_df_wide$avg_effect_2016), 
+                                                                    prob=seq(0, 1, length=num_classes+1), 
+                                                                    type=5, 
+                                                                    na.rm=T), 
+                                                           include.lowest=TRUE, dig.lab=10)
+smoke_pm_effect_plot_df_wide$avg_effect_2016_bucket <- cut(smoke_pm_effect_plot_df_wide$avg_effect_2016, 
+                                                           quantile(c(smoke_pm_effect_plot_df_wide$avg_effect_2011, smoke_pm_effect_plot_df_wide$avg_effect_2016), 
+                                                                    prob=seq(0, 1, length=num_classes+1), 
+                                                                    type=5, 
+                                                                    na.rm=T), 
+                                                           include.lowest=TRUE, dig.lab=10)
+
+smoke_pm_effect_plot_df_wide <- smoke_pm_effect_plot_df_wide %>% 
+  left_join(dist_small, by=c("geoid"="GEOID")) %>% 
+  as.data.frame() %>% 
+  sf::st_as_sf()
+```
+
+
+## Figure 4a: District map
+
+```{r fig_4a}
+mapPlot(smoke_pm_effect_plot_df_wide, 'avg_effect_2011_bucket','outputs/fig_4a_avg_effect_2011.pdf', 
+        '', rev(RColorBrewer::brewer.pal(6,"Reds")), round_digits = 3)
+mapPlot(smoke_pm_effect_plot_df_wide, 'avg_effect_2016_bucket','outputs/fig_4a_avg_effect_2016.pdf', 
+        'SmokePM effect on avg\nscore (% of a stdev)', rev(RColorBrewer::brewer.pal(6,"Reds")), round_digits = 3)
+```
+
+
+## Figure 4b: District rugplot of dollar effects
+
+```{r fig_4b}
+## plotting PNG object 
+p4_png <- ggplot(data=sim_plot_sample_df %>% filter(avg_dollar>XLIM_LOW, avg_dollar<XLIM_HIGH)) + 
+  base_theme + 
+  theme(axis.line=element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        panel.spacing = unit(0.2, "lines"),
+        panel.grid.major.x = element_line(color='grey90',linetype='dashed',size=.3),
+        panel.background = element_blank(),
+        strip.background = element_blank(), 
+        plot.margin=unit(c(25,170,10,15), units="pt"),
+        strip.text.y=element_text(color=NA, face="bold"),
+        axis.text.x=element_text(color=NA),
+        axis.text.y=element_text(color=NA),
+        axis.title.x=element_text(color=NA),
+        axis.ticks.x=element_blank()
+        ) + 
+  geom_point(aes(x=avg_dollar, y=seda_year, color=moderator), alpha=0.05, shape="|", size=6, na.rm=T) +
+  geom_text(data=sim_summary_df, aes(x=XLIM_HIGH+DIST_TO_TEXT, y=seda_year, label=text), color=DEFAULT_COLOR, hjust=0.5, vjust=0.5) +
+  geom_text(data=data.frame(moderator=c("Low econ disadvantage\nLow % non-White"),
+                            l=c("Cumulative Losses\n$ million (95% CI)"), stringsAsFactors = T),
+            aes(label=l),
+            x=XLIM_HIGH+DIST_TO_TEXT, y=10, color=DEFAULT_COLOR, hjust=0.5) +
+  facet_grid(moderator~.) + 
+  scale_y_discrete(expand=c(0.2,0), lim=rev) +
+  scale_color_manual(values = wesanderson::wes_palette("Darjeeling1")) +
+  guides(color=guide_legend(reverse=T)) +
+  scale_x_continuous(labels=scales::dollar_format(), limits=c(XLIM_LOW,NA)) +
+  coord_cartesian(xlim = c(XLIM_LOW, XLIM_HIGH), clip = "off") + 
+  labs(y="", x="SmokePM effect measured as present value\nchange in future earnings ($ per student)")
+
+## remove text layers
+p4_png$layers[[2]] <- NULL
+p4_png$layers[[2]] <- NULL
+
+## temporary png bitmap
+cowplot::save_plot('outputs/fig_4b_png.png', p4_png, base_width=7.5, base_height=11)
+
+## plot text and remove the plot layer
+p4_text <- ggplot(data=sim_plot_sample_df %>% filter(avg_dollar>XLIM_LOW, avg_dollar<XLIM_HIGH)) + 
+  base_theme + 
+  theme(axis.line=element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        panel.spacing = unit(0.2, "lines"),
+        panel.background = element_blank(),
+        strip.background = element_blank(), 
+        plot.margin=unit(c(25,170,10,15), units="pt"),
+        strip.text.y=element_text(face="bold"),
+        rect = element_rect(fill = "transparent"),
+        panel.grid.major.x = element_line(color=NA)
+  ) + 
+  geom_point(aes(x=avg_dollar, y=seda_year, color=moderator), alpha=0.05, shape="|", size=6, na.rm=T) +
+  geom_text(data=sim_summary_df, aes(x=XLIM_HIGH+DIST_TO_TEXT, y=seda_year, label=text), color=DEFAULT_COLOR, hjust=0.5, vjust=0.5) +
+  geom_text(data=data.frame(moderator=c("Low econ disadvantage\nLow % non-White"),
+                            l=c("Cumulative Losses\n$ million (95% CI)"), stringsAsFactors = T),
+            aes(label=l),
+            x=XLIM_HIGH+DIST_TO_TEXT, y=10, color=DEFAULT_COLOR, hjust=0.5) +
+  facet_grid(moderator~.) + 
+  scale_y_discrete(expand=c(0.2,0), lim=rev) +
+  scale_color_manual(values = wesanderson::wes_palette("Darjeeling1")) +
+  guides(color=guide_legend(reverse=T)) +
+  scale_x_continuous(labels=scales::dollar_format(), limits=c(XLIM_LOW,NA)) +
+  coord_cartesian(xlim = c(XLIM_LOW, XLIM_HIGH), clip = "off") +
+labs(y="", x="SmokePM effect measured as present value\nchange in future earnings ($ per student)")
+
+## remove plot layer
+p4_text$layers[[1]] <- NULL
+
+## bring plot layer back in as png and text as vector
+p4 <- cowplot::ggdraw() + 
+  cowplot::draw_image('outputs/fig_4b_png.png') + 
+  cowplot::draw_plot(p4_text) 
+
+cowplot::save_plot('outputs/fig_4b.pdf', p4, base_width=7.5, base_height=11)
+```
+
+
+## Supp Figure 1: Ethnicity/race + ECD heterogeneity
+
+```{r supp_fig_1}
+## ETHNICITY/ SES ##
+mod_avg_wht <- feols(avg_score_unweighted~perecd_bin/perwht_bin/smokePM_anom_school_total + perecd_bin/perwht_bin/smokePM_anom_nonschool_total + 
+                       tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                     cluster='county_fips',
+                     weights=ANALYSIS_DF$avg_student_population,
+                     data=ANALYSIS_DF)$coeftable
+
+mod_avg_blk <- feols(avg_score_unweighted~perecd_bin/perblk_bin/smokePM_anom_school_total + perecd_bin/perblk_bin/smokePM_anom_nonschool_total + 
+                       tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                     cluster='county_fips',
+                     weights=ANALYSIS_DF$avg_student_population,
+                     data=ANALYSIS_DF)$coeftable
+
+mod_avg_hsp <- feols(avg_score_unweighted~perecd_bin/perhsp_bin/smokePM_anom_school_total + perecd_bin/perhsp_bin/smokePM_anom_nonschool_total + 
+                       tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                     cluster='county_fips',
+                     weights=ANALYSIS_DF$avg_student_population,
+                     data=ANALYSIS_DF)$coeftable
+
+mod_avg_asn <- feols(avg_score_unweighted~perecd_bin/perasn_bin/smokePM_anom_school_total + perecd_bin/perasn_bin/smokePM_anom_nonschool_total + 
+                       tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                     cluster='county_fips',
+                     weights=ANALYSIS_DF$avg_student_population,
+                     data=ANALYSIS_DF)$coeftable
+
+## bring model coefficients together
+supp_mod_list <- list("mod_avg_wht"=mod_avg_wht,
+                      "mod_avg_blk"=mod_avg_blk,
+                      "mod_avg_hsp"=mod_avg_hsp,
+                      "mod_avg_asn"=mod_avg_asn
+)
+
+race_eth_vec <- c("wht","blk","hsp","asn")
+search_str <- paste(paste0("^perecd_bin[[:alpha:]]{3,4}:per", race_eth_vec,"_bin[[:alpha:]]{3,4}:smokePM"), collapse="|")
+
+## format data for plotting
+supp_eth_ses_mod_df <- do.call(rbind, supp_mod_list) %>% mutate(row_names=rownames(.)) %>% 
+  tidyr::separate(row_names, into=c("mod_name","var"), sep="[.]") %>% 
+  filter(grepl(search_str, var)) %>% 
+  tidyr::separate(mod_name, into=c("mod","subject", "run"), sep="[_]") %>% 
+  tidyr::separate(var, into=c("moderator1", "moderator2", "var"), sep="[:]") %>% 
+  tidyr::separate(var, into=c("temp1", "temp2", "school", "temp3"), sep="[_]") %>% 
+  select(-c(mod, run, temp1, temp2, temp3)) %>% 
+  rename(est=Estimate, se=`Std. Error`, t_val=`t value`, p_val=`Pr(>|t|)`) %>% 
+  mutate(school = case_when(school == "school" ~ "School",
+                            school == "nonschool" ~ "Non-school"),
+         moderator1 = case_when(moderator1 == "perecd_binHigh" ~ "High econ dis",
+                                moderator1 == "perecd_binLow" ~ "Low econ dis"),
+         moderator2 = case_when(moderator2 == "perwht_binHigh" ~ "High % wht",
+                                moderator2 == "perwht_binLow" ~ "Low % wht",
+                                moderator2 == "perblk_binHigh" ~ "High % blk",
+                                moderator2 == "perblk_binLow" ~ "Low % blk",
+                                moderator2 == "perhsp_binHigh" ~ "High % hsp",
+                                moderator2 == "perhsp_binLow" ~ "Low % hsp",
+                                moderator2 == "perasn_binHigh" ~ "High % asn",
+                                moderator2 == "perasn_binLow" ~ "Low % asn"),
+         moderator = paste0(moderator1,"\n",moderator2),
+         run=case_when(((moderator2=="High % wht")|(moderator2=="Low % wht")) ~ "Race/ethnicity & Economic disadvantage: White",
+                       ((moderator2=="High % blk")|(moderator2=="Low % blk")) ~ "Race/ethnicity & Economic disadvantage: Black",
+                       ((moderator2=="High % hsp")|(moderator2=="Low % hsp")) ~ "Race/ethnicity & Economic disadvantage: Hispanic",
+                       ((moderator2=="High % asn")|(moderator2=="Low % asn")) ~ "Race/ethnicity & Economic disadvantage: Asian")) %>% 
+  select(-c(moderator1, moderator2))
+row.names(supp_eth_ses_mod_df) <- NULL
+
+## bring data together
+supp_mod_df <- bind_rows(supp_eth_ses_mod_df) %>% 
+  mutate(moderator= ordered(moderator, levels=c("Low econ dis\nLow % wht","Low econ dis\nHigh % wht",
+                                                "High econ dis\nLow % wht","High econ dis\nHigh % wht",
+                                                "Low econ dis\nLow % blk","Low econ dis\nHigh % blk",
+                                                "High econ dis\nLow % blk","High econ dis\nHigh % blk",
+                                                "Low econ dis\nLow % hsp","Low econ dis\nHigh % hsp",
+                                                "High econ dis\nLow % hsp","High econ dis\nHigh % hsp",
+                                                "Low econ dis\nLow % asn","Low econ dis\nHigh % asn",
+                                                "High econ dis\nLow % asn","High econ dis\nHigh % asn")))
+
+# 10 ug 
+supp_heterogeneity_10 <- ggplot(data=supp_mod_df %>% filter(school=="School") %>% mutate(est=est*10, se=se*10), aes(color=subject)) + 
+  base_theme + 
+  theme(
+    legend.position = "none"
+  ) + 
+  geom_hline(yintercept = 0, colour = DEFAULT_COLOR, lty = 2) + 
+  geom_linerange(aes(x=moderator, ymin=est-1.96*se, ymax=est+1.96*se),lwd = 1,position=position_dodge2(width=.25), color=LINE_COLOR) + 
+  geom_point(aes(x=moderator, y=est), position=position_dodge2(width=.25), shape = 21, fill = "WHITE", color=LINE_COLOR) + 
+  labs(y=expression(Delta~" Test performance per 10"~mu*"g m"^"-3"~"(% of stdev)"), x="") + 
+  facet_wrap(~run, scales="free_x", ncol=2) + 
+  scale_y_continuous(labels=scales::percent_format(accuracy=.01, suffix=""))
+
+ggsave('outputs/supp_heterogeneity_10.pdf', plot=supp_heterogeneity_10, width=13, height=9)
+```
+
+
+## Supp Figure 2: Baseline PM effects
+
+```{r supp_fig_2}
+BASELINE_ANALYSIS_DF<- ANALYSIS_DF %>% 
+  filter(!is.na(perecd_bin)) %>% 
+  mutate(ecd_nonwht=paste0(perecd_bin,"_",pernonwht_bin)) %>% 
+  group_by(GEOID, fips, stateabb) %>% 
+  mutate(avg_pm=mean(avg_pm25, rm.na=T),
+         avg_smokepm=mean(smokePM_anom_total, na.rm=T))
+
+## separate into different buckets
+BASELINE_ANALYSIS_DF$base_pm_bin <- as.factor(statar::xtile(BASELINE_ANALYSIS_DF$avg_pm, n=3))
+BASELINE_ANALYSIS_DF$avg_smokepm_bin <- as.factor(statar::xtile(BASELINE_ANALYSIS_DF$avg_smokepm, n=3))
+
+fixe_base_avg <- feols(avg_score_unweighted~base_pm_bin/smokePM_anom_school_total + base_pm_bin/smokePM_anom_nonschool_total + 
+                         tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + 
+                         tm70_80 + tm80p + total_ppt| GEOID + year_grade, 
+                       cluster='county_fips',
+                       weights=BASELINE_ANALYSIS_DF$avg_student_population ,
+                       data=BASELINE_ANALYSIS_DF)$coeftable
+
+mod_list <- list("fixe_base_avg"=fixe_base_avg)
+
+## format data for plotting
+base_mod_df <- do.call(rbind, mod_list) %>% mutate(row_names=rownames(.)) %>% 
+  tidyr::separate(row_names, into=c("mod_name","var"), sep="[.]") %>% 
+  filter(grepl("^base_pm_bin", var)) %>% 
+  tidyr::separate(mod_name, into=c("mod", "temp1", "subject"), sep="[_]") %>% 
+  tidyr::separate(var, into=c("bin","temp_school"), sep="[:]") %>% 
+  tidyr::separate(temp_school, into=c("temp2","temp3", "school","temp4"), sep="[_]") %>% 
+  select(-c(mod, temp1, temp2, temp3, temp4)) %>% 
+  rename(est=Estimate, se=`Std. Error`, t_val=`t value`, p_val=`Pr(>|t|)`) %>% 
+  mutate(school = case_when(school == "school" ~ "School",
+                            school == "nonschool" ~ "Non-school"),
+         run="Avg. baseline PM tercile",
+         bin=case_when(bin == "base_pm_bin1" ~ "Low",
+                       bin == "base_pm_bin2" ~ "Medium",
+                       bin == "base_pm_bin3" ~ "High"),
+         bin=ordered(bin, levels=c("Low", "Medium", "High")))
+row.names(base_mod_df) <- NULL
+
+# 10 ug
+p_supp_baseline_10 <- ggplot(data=base_mod_df %>% filter(school=="School") %>% mutate(est=est*10, se=se*10), 
+                             aes(color=subject)) + 
+  base_theme + 
+  theme(
+    legend.position = "none"
+  ) + 
+  geom_hline(yintercept = 0, colour = DEFAULT_COLOR, lty = 2) + 
+  geom_linerange(aes(x=bin, ymin=est-1.96*se, ymax=est+1.96*se),lwd = 1,position=position_dodge2(width=.25)) + 
+  geom_point(aes(x=bin, y=est), position=position_dodge2(width=.25), shape = 21, fill = "WHITE") + 
+  labs(y=expression(Delta~" Test performance per 10"~mu*"g m"^"-3"~"(% of stdev)"), x="", color="Subject") + 
+  facet_grid(~run) + 
+  scale_color_manual(values=c(LINE_COLOR)) +
+  scale_y_continuous(labels=scales::percent_format(accuracy=.001, suffix="")) 
+
+ggsave('outputs/supp_baseline_pm_10.pdf', plot=p_supp_baseline_10, width = 12, height = 5)
+```
+
+
+## Supp Figure 3: Drop distance plots
+
+```{r supp_fig_3}
+drop_km <- c(0, 1, 3, 5, 10, 20)
+COEF_VAR <- "smokePM_anom_school_total"
+
+## drop distance sensitivity
+drop_dist_result_df_school <- pblapply(drop_km, function(km){
+  
+  drop_dist <- km*1000
+  DROP_DIST_ANALYSIS_DF <- ANALYSIS_DF %>% filter(min_dist_meters >= drop_dist)
+  
+  ## regressions
+  avg_mod <- feols(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total +
+                     tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + 
+                     tm70_80 + tm80p + total_ppt| GEOID + year_grade, 
+                   cluster='county_fips',
+                   weights=DROP_DIST_ANALYSIS_DF$avg_student_population,
+                   data=DROP_DIST_ANALYSIS_DF)
+  
+  ## extract results
+  reg_results <- data.frame("subject"=c("School day smoke PM2.5"),
+                            "est"=c(avg_mod$coeftable[COEF_VAR,'Estimate']),
+                            "se"=c(avg_mod$coeftable[COEF_VAR,'Std. Error']),
+                            "tstat"=c(avg_mod$coeftable[COEF_VAR,'t value']),
+                            "n"=c(avg_mod$nobs),
+                            "drop_dist_km"=km)
+  
+  return(reg_results)
+}) %>% 
+  bind_rows() %>%
+  mutate(drop_dist_km=ordered(drop_dist_km, levels=drop_km))
+
+# 10 ug
+drop_plot_10 <- ggplot(data=drop_dist_result_df_school %>% mutate(est=est*10, se=se*10), aes(color=subject, group=subject)) + 
+  base_theme + 
+  theme(
+    legend.position="none"
+  ) +
+  geom_linerange(aes(x=drop_dist_km, ymin=est-1.96*se, ymax=est+1.96*se), lwd=1, 
+                 position=position_dodge(width=1/2)) +
+  geom_point(aes(x=drop_dist_km, y=est), position=position_dodge2(width=1/2), shape = 21, fill = "WHITE") +
+  geom_text(aes(x=drop_dist_km, y=-0.0011, label=paste("n = ",n)), color=DEFAULT_COLOR) + 
+  scale_color_manual(values=c(LINE_COLOR, LINE_COLOR)) + 
+  geom_hline(yintercept=0, color="gray", lwd=0.55, lty=2) +
+  labs(x="Drop Distance (km)", y=expression(atop(Delta~" Test performance per", "10"~mu*"g m"^"-3"~"(% of stdev)")), fill="", color="") +
+  scale_y_continuous(labels=scales::percent_format(accuracy=.001, suffix=""), limits=c(-0.0011, NA))
+
+ggsave('outputs/supp_drop_plot_10.pdf', plot=drop_plot_10, width = 12, height = 4)
+```
+
+
+## Supp Figure 4: Total smoke PM rug plot
+
+```{r supp_fig_4}
+## total smoke effect 
+fixe_bin_avg_total <- feols(avg_score_unweighted~perecd_bin/pernonwht_bin/smokePM_anom_total + 
+                              tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt| GEOID + year_grade, 
+                            cluster='county_fips',
+                            weights=ANALYSIS_DF$avg_student_population,
+                            data=ANALYSIS_DF)
+
+## calculate avg effects for all districts
+## smoke exposure for all districts
+drop_states <- c("60","66","69","72","78","15","02")
+smoke_pm_map_df_total <- dist_year_smoke_pm %>%
+  mutate(fips=str_sub(geoid,1,2)) %>% 
+  filter(fips%not_in%drop_states,
+         seda_year>=2009, seda_year<2017) %>% 
+  group_by(fips, geoid, seda_year) %>% 
+  summarize(smokePM_anom_total=mode(smokePM_anom_total)
+  ) %>% 
+  as.data.frame()
+
+## get perecd, pernonwht, total students for districts that have it and fill in blanks with most recent 
+hetero_med_df <- ANALYSIS_DF %>%
+  group_by(GEOID, year) %>% 
+  summarize(med_perecd=median(perecd, na.rm=T),
+            med_pernonwht=median(pernonwht, na.rm=T),
+            mode_perecd_bin=mode(perecd_bin),
+            mode_pernonwht_bin=mode(pernonwht_bin),
+            num_ela_students=sum(totgyb_all_ela, na.rm=T),
+            num_math_students=sum(totgyb_all_math, na.rm=T)) %>% 
+  mutate(year=as.integer(as.character(year))) %>% 
+  tidyr::complete(year=2009:2016) %>% 
+  tidyr::fill(med_perecd,med_pernonwht,mode_perecd_bin,mode_pernonwht_bin,num_ela_students,num_math_students, .direction = "downup")
+
+## CONVERT to dollars...
+chetty_conversion_rate <- 0.13 # 1sd teacher effect on test scores (in sd)
+
+# create sim for the different moderator bins
+NUM_SIMS <- 3000
+set.seed(42)
+hetero_levels <- expand.grid(ecd=c("Low","High"),
+                             nonwht=c("Low","High"), stringsAsFactors=F)
+
+hetero_sim_df_total <- lapply(1:nrow(hetero_levels), function(i){
+  coef_str <- paste0('perecd_bin', hetero_levels[[i, 'ecd']], ':pernonwht_bin', hetero_levels[[i, 'nonwht']],':smokePM_anom_total')
+  sim_vec <- rnorm(NUM_SIMS, summary(fixe_bin_avg_total)$coeftable[coef_str,'Estimate'], summary(fixe_bin_avg_total)$coeftable[coef_str,'Std. Error'])
+  
+  cbind(data.frame('perecd_bin'=hetero_levels[[i, 'ecd']],
+                   'pernonwht_bin'=hetero_levels[[i, 'nonwht']]),
+        sim_vec %>% t())
+  
+}) %>% bind_rows()
+
+## district level sim avg effect for moderators (base data used for fig 4 plots)
+sim_effects_df_total <- smoke_pm_map_df_total %>%
+  select(fips, geoid, seda_year, smokePM_anom_total) %>% 
+  left_join(hetero_med_df, by=c("geoid"="GEOID", "seda_year"="year")) %>% 
+  mutate(tot_students=round((num_ela_students+num_math_students)/2,0)) %>%  # total num students is avg of math and ela test takers...)
+  left_join(hetero_sim_df, by=c("mode_perecd_bin"="perecd_bin", "mode_pernonwht_bin"="pernonwht_bin"))
+
+## district level sim avg dollar per student
+sim_dollar_df_total <- sim_effects_df_total %>% 
+  mutate(across(as.character(1:NUM_SIMS), ~.x*smokePM_anom_total*100)) %>% # calc the avg_effect for each sim column
+  mutate(across(as.character(1:NUM_SIMS), ~(.x/100)*7000/chetty_conversion_rate)) %>%  # calc the avg_dollar per student for each sim
+  mutate(mode_perecd_bin = case_when(mode_perecd_bin == "High" ~ "High econ disadvantage",
+                                     mode_perecd_bin == "Low" ~ "Low econ disadvantage"),
+         mode_pernonwht_bin = case_when(mode_pernonwht_bin == "High" ~ "High % non-White",
+                                        mode_pernonwht_bin == "Low" ~ "Low % non-White"),
+         moderator = paste0(mode_perecd_bin,"\n",mode_pernonwht_bin),
+         moderator = ordered(moderator, levels=c("Low econ disadvantage\nLow % non-White",
+                                                 "Low econ disadvantage\nHigh % non-White",
+                                                 "High econ disadvantage\nLow % non-White",
+                                                 "High econ disadvantage\nHigh % non-White"))
+  ) %>% 
+  tidyr::drop_na(moderator)
+
+TEMP_ANALYSIS_DF_LONG_TOTAL <- smoke_pm_map_df_total %>%
+  select(fips, geoid, seda_year, smokePM_anom_total) %>% 
+  left_join(hetero_med_df, by=c("geoid"="GEOID", "seda_year"="year")) %>% 
+  mutate(avg_effect=getcoef(summary(fixe_bin_avg_total)$coeftable, "perecd_bin", "pernonwht_bin", "smokePM_anom_total", mode_perecd_bin, mode_pernonwht_bin)*smokePM_anom_total*100,
+         se=getcoef(summary(fixe_bin_avg_total)$coeftable, "perecd_bin", "pernonwht_bin", "smokePM_anom_total", mode_perecd_bin, mode_pernonwht_bin, 'Std. Error'),
+         t_stat_abs=abs(getcoef(summary(fixe_bin_avg_total)$coeftable, "perecd_bin", "pernonwht_bin", "smokePM_anom_total", mode_perecd_bin, mode_pernonwht_bin, 't value')))
+
+## get district shapes
+drop_states <- c(60,66,69,72,78,15,2)
+dist_small <- dist[c("GEOID","geometry", "extracted_fips")] %>%
+  tidyr::drop_na(GEOID) %>%
+  filter(extracted_fips%not_in%drop_states)
+
+# finish setting up the mapping df
+smoke_pm_effect_plot_df_wide_total <- TEMP_ANALYSIS_DF_LONG_TOTAL %>% 
+  filter(seda_year%in%c(2011, 2016)) %>% 
+  tidyr::pivot_wider(id_cols=c("geoid"),
+                     names_from=seda_year,
+                     values_from=c("avg_effect", "t_stat_abs"))
+
+## avg_effects
+num_classes <- 6 # num_classes <- 4 if doing the dot sig alternative map
+smoke_pm_effect_plot_df_wide_total$avg_effect_2011_bucket <- cut(smoke_pm_effect_plot_df_wide_total$avg_effect_2011, 
+                                                                 quantile(c(smoke_pm_effect_plot_df_wide_total$avg_effect_2011, smoke_pm_effect_plot_df_wide_total$avg_effect_2016), 
+                                                                          prob=seq(0, 1, length=num_classes+1), 
+                                                                          type=5, 
+                                                                          na.rm=T), 
+                                                                 include.lowest=TRUE, dig.lab=10)
+smoke_pm_effect_plot_df_wide_total$avg_effect_2016_bucket <- cut(smoke_pm_effect_plot_df_wide_total$avg_effect_2016, 
+                                                                 quantile(c(smoke_pm_effect_plot_df_wide_total$avg_effect_2011, smoke_pm_effect_plot_df_wide_total$avg_effect_2016), 
+                                                                          prob=seq(0, 1, length=num_classes+1), 
+                                                                          type=5, 
+                                                                          na.rm=T), 
+                                                                 include.lowest=TRUE, dig.lab=10)
+
+smoke_pm_effect_plot_df_wide_total <- smoke_pm_effect_plot_df_wide_total %>% 
+  left_join(dist_small, by=c("geoid"="GEOID")) %>% 
+  as.data.frame() %>% 
+  sf::st_as_sf()
+
+# dollar effects
+## set up for plotting district rugplot
+sim_dollar_plot_df_total <- sim_dollar_df_total %>% 
+  select(fips, geoid, seda_year, moderator, as.character(1:NUM_SIMS)) %>% 
+  mutate(seda_year=ordered(seda_year, levels=2009:2016)) %>% 
+  as.data.table() %>% 
+  melt(id.vars=c("fips","geoid","seda_year","moderator"), variable.name="sim", value.name="avg_dollar")
+
+sim_plot_sample_df_total <- sim_dollar_plot_df_total[,.SD[sample(.N, min(1,.N))],by = c("fips","geoid","seda_year","moderator")]
+
+## get the CI for cumulative dollar effect
+sim_summary_df_total <- sim_dollar_df_total %>% group_by(moderator, seda_year) %>% 
+  summarize(across(as.character(1:NUM_SIMS), ~sum(.x*tot_students))) %>% 
+  tidyr::pivot_longer(cols=as.character(1:NUM_SIMS), names_to="sim", values_to="total_dollar_effect") %>% 
+  group_by(moderator, seda_year) %>% 
+  summarize(total_dollar_effect_q=round(quantile(total_dollar_effect, c(0.025, 0.5, 0.975))/1000000,0), q=c(0.025, 0.5, 0.975)) %>% 
+  tidyr::pivot_wider(names_from="q", values_from="total_dollar_effect_q") %>% 
+  mutate(seda_year=ordered(seda_year, levels=2009:2016),
+         `0.025`=scales::dollar(`0.025`),
+         `0.5`=scales::dollar(`0.5`),
+         `0.975`=scales::dollar(`0.975`),
+         text=paste0(`0.5`, " (", `0.025`, " to ",`0.975`,")"))
+
+# dollar effect rug plot by year
+XLIM_LOW <- -2500
+XLIM_HIGH <- 1000
+DIST_TO_TEXT <- 1600
+p4_total <- ggplot(data=sim_plot_sample_df_total %>% filter(avg_dollar>XLIM_LOW, avg_dollar<XLIM_HIGH)) + 
+  base_theme + 
+  theme(axis.line=element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        panel.spacing = unit(0.2, "lines"),
+        panel.grid.major.x = element_line(color='grey90',linetype='dashed',size=.3),
+        panel.background = element_blank(),
+        strip.background = element_blank(), 
+        plot.margin=unit(c(25,170,10,15), units="pt"),
+        strip.text.y=element_text(face="bold")) + 
+  geom_point(aes(x=avg_dollar, y=seda_year, color=moderator), alpha=0.05, shape="|", size=6, na.rm=T) +
+  geom_text(data=sim_summary_df_total, aes(x=XLIM_HIGH+DIST_TO_TEXT, y=seda_year, label=text), color=DEFAULT_COLOR, hjust=0.5, vjust=0.5) +
+  geom_text(data=data.frame(moderator=c("Low econ disadvantage\nLow % non-White"),
+                            l=c("Cumulative Losses\n$ million (95% CI)"), stringsAsFactors = T),
+            aes(label=l),
+            x=XLIM_HIGH+DIST_TO_TEXT, y=10, color=DEFAULT_COLOR, hjust=0.5) +
+  facet_grid(moderator~.) + 
+  scale_y_discrete(expand=c(0.2,0), lim=rev) +
+  scale_color_manual(values = wesanderson::wes_palette("Darjeeling1")) +
+  guides(color=guide_legend(reverse=T)) +
+  scale_x_continuous(labels=scales::dollar_format(), limits=c(XLIM_LOW,NA)) +
+  coord_cartesian(xlim = c(XLIM_LOW, XLIM_HIGH), clip = "off") +
+  labs(y="", x="SmokePM effect measured as present value\nchange in future earnings ($ per student)")
+
+cowplot::save_plot('outputs/supp_total_smokepm_impacts.pdf', p4_total, base_width=7.5, base_height=11)
+```
+
+
+## Supp Figure 5: Randomization test state level shuffling district time series
+
+```{r supp_fig_5}
+ANALYSIS_DT <- ANALYSIS_DF %>% as.data.table()
+ANALYSIS_UNIQUE_DT <- unique(ANALYSIS_DT[,.(fips, GEOID)], by=c("fips","GEOID"))
+
+## function for performing permuation test where we randomly shuffle district time series across state
+permTestStateTrend <- function(i, outcome, rhs, data, treatment){
+  
+  ANALYSIS_KEY_DT <- ANALYSIS_UNIQUE_DT[,.(GEOID=GEOID, GEOID_new=sample(GEOID, size=.N, replace=F)),by=c("fips")]
+  NEW_ANALYSIS_DT <- merge(data[,c("fips", "county_fips","GEOID", "year_grade","tm0","tm0_10","tm10_20","tm20_30","tm30_40",
+                                   "tm40_50","tm50_60","tm70_80","tm80p","total_ppt","avg_student_population",
+                                   "totgyb_all_ela","totgyb_all_math","avg_score_unweighted")], 
+                           ANALYSIS_KEY_DT, by=c("fips","GEOID"))
+  
+  NEW_ANALYSIS_DT[,GEOID:=NULL
+  ][data, `:=`(smokePM_anom_school_total_new=i.smokePM_anom_school_total,
+               smokePM_anom_nonschool_total=i.smokePM_anom_nonschool_total,
+               avg_student_population_new=i.avg_student_population), on=c("GEOID_new"="GEOID", "year_grade"="year_grade")]
+  
+  fmla <- paste0(outcome,"~",rhs)
+  fixe_est <- feols(as.formula(stringr::str_replace_all(fmla, treatment, paste0(treatment,"_new"))), 
+                    weights=NEW_ANALYSIS_DT$avg_student_population, # use population weights from old district
+                    data=NEW_ANALYSIS_DT)
+  
+  ## no clustering SEs here because we are just interested in the coef estimates
+  fixest_df <- data.frame("coef"=c(summary(fixe_est)$coefficients[[paste0(treatment,"_new")]]),
+                          "subject"="avg")
+  
+  return(fixest_df)
+}
+
+TREATMENT_VAR <- 'smokePM_anom_school_total'
+start_time <- Sys.time()
+result_df <- pbmclapply(1:1000, permTestStateTrend, 
+                        outcome="avg_score_unweighted",
+                        rhs="smokePM_anom_school_total + smokePM_anom_nonschool_total + 
+                             tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 +
+                             tm80p + total_ppt|GEOID_new + year_grade", 
+                        data=ANALYSIS_DT, 
+                        treatment=TREATMENT_VAR) %>%
+  bind_rows()
+end_time <- Sys.time()
+end_time-start_time
+
+fixe_avg <- feols(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total + tm0 + tm0_10 + tm10_20 + tm20_30 + 
+                    tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade,
+                  cluster='county_fips',
+                  weights=ANALYSIS_DF$avg_student_population,
+                  data=ANALYSIS_DF)
+
+ecdf(result_df$coef)(summary(fixe_avg)$coefficient[TREATMENT_VAR])
+
+# 10ug
+supp_plot_10 <- ggplot(data=result_df %>% mutate(coef=coef*10), aes(color=subject)) + 
+  base_theme +
+  theme(
+    legend.position="none",
+  ) + 
+  geom_histogram(aes(x=coef, fill=subject), bins=35, alpha=0.3, position="identity") + 
+  geom_vline(xintercept=summary(fixe_avg)$coefficient[TREATMENT_VAR]*10, lty = 2, color=LINE_COLOR) +
+  annotate("text", x=summary(fixe_avg)$coefficient[TREATMENT_VAR]*10+0.000015, y=75, 
+           label = "Observed", color=DEFAULT_COLOR, angle=90) + 
+  coord_cartesian(xlim=c(-0.00065, 0.0003), ylim=c(0,150), expand=F) +
+  scale_fill_manual(values=c(LINE_COLOR)) +
+  scale_color_manual(values=c(LINE_COLOR)) +
+  labs(x=expression("Estimated coefficient per 10 "*mu*"g m"^"-3"~"(% of stdev)"), y="Frequency", fill="", color="") +
+  scale_x_continuous(labels=scales::percent_format(accuracy=.001, suffix=""))
+
+ggsave("outputs/supp_randomization_test_state_trend_10.pdf", plot=supp_plot_10, width=8, height=3)
+```
+
+
+## Supp Figure 6: Fixed-effect vs. mixed-effect simulation
+
+* This code chunk takes a significant amount of time to run depending on the number of cores available (~2hrs with 12 cores and default `pbmclapply` settings).
+
+```{r smokepm_school_lme}
+VAR <- 'smokePM_anom_school_total'
+sim_dt <- pbmclapply(1:500, function(x){
+  
+  selected_geoid <- unique(ANALYSIS_DF$GEOID)[sample(1:length(unique(ANALYSIS_DF$GEOID)),10000)]
+                                           
+  dta <- ANALYSIS_DF %>%
+    filter(GEOID %in% selected_geoid)
+  
+  fe_mod <- feols(avg_score_unweighted~smokePM_anom_school_total + smokePM_anom_nonschool_total + tm0 + tm0_10 + 
+                    tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + 
+                    total_ppt | GEOID + year_grade,
+                  weights=dta$avg_student_population,
+                  data=dta)$coeftable
+  
+  lme_mod <- summary(lme4::lmer(avg_score_unweighted ~ smokePM_anom_school_total + smokePM_anom_nonschool_total + 
+                                  tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + 
+                                  tm80p + total_ppt + (1|GEOID) + year_grade,
+                                weights=dta$avg_student_population,
+                                data = dta))$coefficients
+  
+  temp_dt <- data.table(mod=c("Fixed-effect", "Mixed-effect"),
+                        run=x,
+                        est=c(fe_mod[VAR,'Estimate'], lme_mod[VAR,'Estimate']),
+                        se=c(fe_mod[VAR,'Std. Error'], lme_mod[VAR,'Std. Error']))
+  
+  return(temp_dt)
+}) %>% bind_rows()
+
+saveRDS(sim_dt, '~/Stanford/projects/wildfire_smoke_education_natsustain/data/sim/sim_dt.rds')
+
+supp_sim <- ggplot(data=sim_dt %>%  mutate(est=est*10, se=se*10)) + 
+    base_theme +
+    geom_point(aes(x=mod,y=est, group=run), alpha=0.1, shape="—", size=6) + 
+    geom_hline(yintercept=0, color='gray80', lty=2) + 
+    labs(x="Model", y=expression(Delta~" Test performance per 10"~mu*"g m"^"-3"~"(% of stdev)")) + 
+    scale_y_continuous(labels=scales::percent_format(accuracy=.01, suffix="")) + 
+    coord_cartesian(ylim=c(NA, 0))
+
+ggsave("outputs/supp_fe_re_sim_10.pdf", plot=supp_sim, width=8, height=5, device=cairo_pdf)
+```
+
+
+## Supp table S1 & S2: Heterogeneity summary stats 
+
+```{r supp_table_1-2}
+TEMP_TABLE_DF <- ANALYSIS_DF %>% 
+  select(GEOID, year, grade, `Black`=perblk_bin, `Hispanic`=perhsp_bin, `White`=perwht_bin, 
+         `Asian`=perasn_bin,`Native Amer.`=perind_bin,
+         `% Econ. Dis`=perecd_bin, `Total SmokePM`=smokePM_anom_total, 
+         `School SmokePM`=smokePM_anom_school_total, `Nonschool SmokePM`=smokePM_anom_nonschool_total) %>% 
+  tidyr::pivot_longer(cols=c("Black","Hispanic","White","Asian","Native Amer."), names_to="Race/Ethnicity", values_to="Level") %>% 
+  tidyr::pivot_longer(cols=c("Total SmokePM","School SmokePM","Nonschool SmokePM"), names_to="Category", values_to="SmokePM")
+
+## S1
+modelsummary::datasummary(SmokePM*Median*Category~`Race/Ethnicity`*Level, 
+                          data=TEMP_TABLE_DF, output='latex')
+
+## S2
+modelsummary::datasummary(SmokePM*Median*Category~Heading(`% Economic Disadvantage`) * `% Econ. Dis`, 
+                          data=TEMP_TABLE_DF, sparse_header=FALSE, output='latex')
+```
+
+
+## Supp table S3: Percent distribution of districts across baseline PM levels 
+
+```{r supp_table_3}
+## make sure to run the supplemental baseline PM effects section above to get the BASELINE_ANALYSIS_DF
+baseline_pm_dist_summary_df <- BASELINE_ANALYSIS_DF %>% 
+  select(GEOID, fips, grade, year, ecd_nonwht, base_pm_bin, avg_smokepm_bin) %>% 
+  group_by(ecd_nonwht) %>% 
+  mutate(n_distinct_subgroup_geoid=n_distinct(GEOID)) %>% 
+  group_by(ecd_nonwht, base_pm_bin) %>% 
+  summarize(n=n_distinct(GEOID)/n_distinct_subgroup_geoid) %>% 
+  unique() %>% 
+  mutate(ecd_nonwht=case_when(ecd_nonwht == "High_High" ~ "High econ dis & High % non-White",
+                              ecd_nonwht == "High_Low" ~ "High econ dis & Low % non-White",
+                              ecd_nonwht == "Low_High" ~ "Low econ dis & High % non-White",
+                              ecd_nonwht == "Low_Low" ~ "Low econ dis & Low % non-White"),
+         base_pm_bin=case_when(base_pm_bin == 1 ~ "Low",
+                               base_pm_bin == 2 ~ "Medium",
+                               base_pm_bin == 3 ~ "High"),
+         base_pm_bin=ordered(base_pm_bin, levels=c("Low", "Medium", "High")),
+         n=n*100) %>% 
+  as.data.frame() %>% 
+  tidyr::spread(base_pm_bin, n) %>% 
+  rename('Econ disadvantage & racial-ethnic subgroup'="ecd_nonwht")
+
+modelsummary::datasummary_df(baseline_pm_dist_summary_df, sparse_header=FALSE, output='latex')
+```
+
+
+## Supp table S4: Distributed lag
+
+```{r supp_table_4}
+TEMP_ANALYSIS_DF <- as.data.table(ANALYSIS_DF)
+TEMP_ANALYSIS_DF[, c("schoollag1", "schoollag2") := shift(.SD, 1:2, type="lag"), 
+                 by=c("GEOID", "grade"), .SDcols=c("smokePM_anom_school_total")]
+TEMP_ANALYSIS_DF[, c("nonschoollag1", "nonschoollag2") := shift(.SD, 1:2, type="lag"),
+                 by=c("GEOID", "grade"), .SDcols=c("smokePM_anom_nonschool_total")]
+
+fitstat_register(type = "temp_ctrl", alias = "Temperature control",
+                 fun = function(x){return("x")})
+fitstat_register(type = "precip_ctrl", alias = "Precipitation control",
+                 fun = function(x){return("x")})
+
+# stable sample 10ug table
+mod_nolag_stable_10 <- feols(avg_score_unweighted~smokePM_anom_school_total +
+                               smokePM_anom_nonschool_total + 
+                               tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                             cluster='county_fips',
+                             weights=TEMP_ANALYSIS_DF  %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2)) %>% .$avg_student_population,
+                             data=TEMP_ANALYSIS_DF %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2))%>% mutate(avg_score_unweighted=avg_score_unweighted*100, 
+                                                                                                                                                              smokePM_anom_school_total=smokePM_anom_school_total/10, 
+                                                                                                                                                              smokePM_anom_nonschool_total=smokePM_anom_nonschool_total/10))
+
+mod_lag1_stable_10 <- feols(avg_score_unweighted~smokePM_anom_school_total + schoollag1 + 
+                              smokePM_anom_nonschool_total + nonschoollag1 + 
+                              tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                            cluster='county_fips',
+                            weights=TEMP_ANALYSIS_DF  %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2)) %>% .$avg_student_population,
+                            data=TEMP_ANALYSIS_DF %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2))%>% mutate(avg_score_unweighted=avg_score_unweighted*100, 
+                                                                                                                                                             smokePM_anom_school_total=smokePM_anom_school_total/10, 
+                                                                                                                                                             smokePM_anom_nonschool_total=smokePM_anom_nonschool_total/10))
+
+mod_lag2_stable_10 <- feols(avg_score_unweighted~smokePM_anom_school_total + schoollag1 + schoollag2 + 
+                              smokePM_anom_nonschool_total + nonschoollag1 + nonschoollag2 + 
+                              tm0 + tm0_10 + tm10_20 + tm20_30 + tm30_40 + tm40_50 + tm50_60 + tm70_80 + tm80p + total_ppt|GEOID + year_grade, 
+                            cluster='county_fips',
+                            weights=TEMP_ANALYSIS_DF  %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2)) %>% .$avg_student_population,
+                            data=TEMP_ANALYSIS_DF %>% filter(!is.na(schoollag1), !is.na(schoollag2), !is.na(nonschoollag1), !is.na(nonschoollag2))%>% mutate(avg_score_unweighted=avg_score_unweighted*100, 
+                                                                                                                                                             smokePM_anom_school_total=smokePM_anom_school_total/10, 
+                                                                                                                                                             smokePM_anom_nonschool_total=smokePM_anom_nonschool_total/10))
+
+etable(list(mod_nolag_stable_10, mod_lag1_stable_10, mod_lag2_stable_10), 
+       dict=c("smokePM_anom_school_total"="Contemporaneous year school smoke PM2.5",
+              "schoollag1"="1 year lagged school smoke PM2.5",
+              "schoollag2"="2 year lagged school smoke PM2.5",
+              "GEOID"="District",
+              "year_grade"="Year x Grade"),
+       drop=c("!smoke PM2.5"),
+       depvar = F,
+       # style.tex = style.tex("aer")
+       digits = "r3",
+       # tex = TRUE,
+       signifCode = NA, 
+       notes="Standard errors clustered by county are shown in parentheses. Effect estimates are represented as a percent of a standard deviation change in average test score.",
+       fitstat = ~ temp_ctrl + precip_ctrl + n)
+```
+
+
+
