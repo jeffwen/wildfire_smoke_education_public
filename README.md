@@ -1,6 +1,6 @@
 # Wildfire smoke impacts on test scores
 
-Replication materials for Wen &amp; Burke 2022: "Lower test scores from wildfire smoke exposure"
+Replication materials for Wen &amp; Burke 2022: "[Lower test scores from wildfire smoke exposure](https://www.nature.com/articles/s41893-022-00956-y)"
 
 The materials in this repository allow users to reproduce the figures and calculations appearing in the main text and 
 supplementary information of the paper.
